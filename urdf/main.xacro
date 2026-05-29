@@ -1,0 +1,10 @@
+<?xml version = "1.0"?>
+<robot name = "loc_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <xacro:include filename = "properties.xacro" />
+    <xacro:include filename = "properties_gazebo.xacro" />
+    <xacro:include filename = "my_robot.xacro" />
+    <xacro:include filename = "camera.xacro" />
+    <xacro:include filename = "lidar.xacro" />
+    
+</robot>
