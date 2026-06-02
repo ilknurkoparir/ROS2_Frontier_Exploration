@@ -1,493 +1,566 @@
-import numpy as np
 import rclpy
-import math
-import time
-from random import randrange
 from rclpy.node import Node
-from nav_msgs.msg import OccupancyGrid
-from nav2_msgs.msg import BehaviorTreeLog
-from geometry_msgs.msg import PoseWithCovarianceStamped
-from geometry_msgs.msg import PoseStamped
-from geometry_msgs.msg import PointStamped
-from nav_msgs.msg import Path
-from sensor_msgs.msg import PointCloud2
-from sensor_msgs_py import point_cloud2
-from std_msgs.msg import Header
+
+from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+
+import numpy as np
+import math
+import heapq
+import threading
+import time
+import yaml
+
+from sklearn.cluster import KMeans
+import os
+from ament_index_python.packages import get_package_share_directory
+import yaml
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import OccupancyGrid , Odometry
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+import numpy as np
+import heapq , math , random , yaml
+import scipy.interpolate as si
+import sys , threading , time
+
+# ---------------- CONFIG ----------------
 
 
-class Autopilot(Node):
+pkg_dir = get_package_share_directory('slam_optimization_pkg')
+config_path = os.path.join(pkg_dir, 'config', 'params.yaml')
 
-    def __init__(self):
-        super().__init__('autopilot')
-        """Initialize autopilot parameters:
-
-        potential_pos (OccupancyGrid): Occupancy grid index associated with next potential position
-
-        occupancy_grid (OccupancyGrid): Current occupancy grid information received from '/map'. References callback function 'next_waypoint'
-        
-        """
-        # Allow callback functions to be called in parallel
-        #self.parallel_callback_group = ReentrantCallbackGroup()
-
-        #counter for new strategies when map is fully searched
-        self.new_strat_counter = 0
-
-        #Initializing variable for tracking if map is fully mapped
-        self.fully_mapped = False
-
-        # Initilizing the probablity at which we consider there to be an obstacle
-        self.obstacle_probability = 75
-
-        # Specifies how many incoming messages should be buffered
-        self.queue_size = 10
-
-        # Flag variable that indicates that the exploration is just started
-        self.start=True
-
-        # Initialize the number of waypoints published
-        self.waypoint_counter = 0
-
-        self.goal_updated_counter=0
-
-        # Initialize the number of waypoints published with the new strategy
-        self.new_strategy_counter = 0
-
-        # Initiliazing distance to localise to ArUco marker
-        self.desired_distance=3.0
-
-
-        self.aruco_detected = False
-        self.localisation_started = False
-
-        # Initialize the current grid
-        self.current_grid = OccupancyGrid()
-
-        self.pose_to_aruco = PoseStamped()
-
-        # Initializing x and y coordinates of Turtlebot in space, to be populated later
-        self.new_waypoint = PoseStamped()
-        self.new_waypoint.header.frame_id = 'map'
-        self.new_waypoint.pose.position.x = 0.0
-        self.new_waypoint.pose.position.y = 0.0
-        self.new_waypoint.pose.orientation.w = 1.0
-
-        # Initializing potential_coordinate for debugging
-        self.potential_coordinate = PointStamped()
-        self.potential_coordinate.header.frame_id = 'map'
-        self.potential_coordinate.point.x = 0.0
-        self.potential_coordinate.point.y = 0.0
-
-        #Initializing current position variable
-        self.current_position = PoseStamped()
-        self.current_position.header.frame_id = 'map'
-
-        #Initializing number of iterations before the strategy is changed
-        self.strategy_counter = 10
-
-        #Subscribe to /behavior_tree_log to determine when Turtlebot is ready for a new waypoint
-        self.behaviortreelogstate = self.create_subscription(
-            BehaviorTreeLog,
-            'behavior_tree_log',
-            self.readiness_check,
-            self.queue_size,
-            #callback_group=self.parallel_callback_group
-        )
-
-        #Subscribe to OccupancyGrid type topic "/map"
-        self.potential_pos = OccupancyGrid()
-        self.occupancy_grid = self.create_subscription(
-            OccupancyGrid,
-            '/global_costmap/costmap',
-            self.store_grid,
-            self.queue_size
-        )
-
-        #Subscribe to /pose to determine position of Turtlebot
-        self.position_subscriber = self.create_subscription(
-            PoseWithCovarianceStamped,
-            '/pose',
-            self.current_position_callback,
-            self.queue_size,
-            #callback_group=self.parallel_callback_group
-        )
-
-        self.aruco_map_position_sub = self.create_subscription(
-            PointStamped,
-            'aruco_map_position',
-            self.aruco_map_position_callback,
-            1
-        ) 
-
-        #Create publisher to publish next waypoint parameters to
-        self.waypoint_publisher = self.create_publisher(
-            PoseStamped,
-            'goal_pose',
-            self.queue_size
-        )
-
-        #Publisher for publishing potential waypoints to for bug fixing
-        self.potential_publisher = self.create_publisher(
-            PointStamped,
-            'potential_point',
-            self.queue_size
-        )
-
-        #Publisher for publishing current coordinate for bug fixing
-        self.current_publisher = self.create_publisher(
-            PointStamped,
-            'current_point',
-            self.queue_size
-        )
+with open(config_path, 'r') as file:
+    params = yaml.load(file, Loader=yaml.FullLoader)
 
 
 
+lookahead_distance = params["lookahead_distance"]
+speed = params["speed"]
+expansion_size = params["expansion_size"]
+target_error = params["target_error"]
+robot_r = params["robot_r"]
 
+pathGlobal = 0
 
-    
-    
-    def store_grid(self,grid:OccupancyGrid):
-        """ 
-            Callback function of /map topic.
-            Everytime it receives the OccupacyGrid message it stores it.
-            At the start it launches the next_point() method since no message is received from the behavior_tree_log.
-        """
-        self.current_grid=grid
+def euler_from_quaternion(x,y,z,w):
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = math.atan2(t0, t1)
+    t2 = +2.0 * (w * y - z * x)
+    t2 = +1.0 if t2 > +1.0 else t2
+    t2 = -1.0 if t2 < -1.0 else t2
+    pitch_y = math.asin(t2)
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = math.atan2(t3, t4)
+    return yaw_z
 
-        #Initiates looking for new waypoint if exploration has just started.
-        #This is because readiness_check will not do this when exploration has just started
-        if self.start:
-            self.next_waypoint()
-            self.start = False
-            
-            
+def heuristic(a, b):
+    return np.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
 
-    def next_waypoint(self):
-        """
-        Function to choose next waypoint when new occupancy grid is received, and old goal is either destroyed or achieved
-
-        Args:
-        self (Node): Autopilot node currently running and storing waypoint decisions 
-        """
-
-        self.width = self.current_grid.info.width
-        isthisagoodwaypoint = False
-
-        not_in_range_count=0
-        points_checked = 0
-
-
-        min_distance = 1
-        max_distance = 3
-
-        still_looking = False
-        occupancy_data_np = np.array(self.current_grid.data)
-
-        if self.strategy_counter > 0:
-
-            while not isthisagoodwaypoint:
-                
-                points_checked += 1
-
-
-                if self.new_strat_counter > 5:
-                    self.get_logger().info('Could not find point after 5 new strategy searches, map is likely fully resolved, retracing...')
-                    time.sleep(2)
-                    self.fully_mapped = True
-                    self.new_strat_counter = 0
-                if points_checked > 10000:
-                    self.get_logger().info('Maximum number of iterations exceeded, adopting new strategy...')
-                    time.sleep(2)
-                    self.new_strategy()
-                    self.new_strat_counter += 1
-                    isthisagoodwaypoint = True
-                    break
-
-
-                # Added this so that the terminal isn't filled with messages so it's easier to read
-                if not still_looking:
-                    self.get_logger().info('Searching for good point...')
-                    still_looking = True
-
-                # Taking a random cell and the corresponding cost value
-                random_index = randrange(occupancy_data_np.size)
-                self.potential_pos = occupancy_data_np[random_index]
-
-                # Check that the cell is not unknown
-                if self.potential_pos == -1:
-                    continue
-
-                # Compute correspondent row and column of the potential cell 
-                [self.potential_coordinate.point.x, self.potential_coordinate.point.y] = self.cell_coordinates(random_index)
-                
-                # Publish current position and potential position for visualization
-                self.potential_publisher.publish(self.potential_coordinate)
-        
-
-                # Check that the cell is not an obstacle and is on the frontier
-                if self.potential_pos>= self.obstacle_probability or not self.frontier_check(occupancy_data_np, random_index):
-                    continue
+def astar(array, start, goal):
+    neighbors = [(0,1),(0,-1),(1,0),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
+    close_set = set()
+    came_from = {}
+    gscore = {start:0}
+    fscore = {start:heuristic(start, goal)}
+    oheap = []
+    heapq.heappush(oheap, (fscore[start], start))
+    while oheap:
+        current = heapq.heappop(oheap)[1]
+        if current == goal:
+            data = []
+            while current in came_from:
+                data.append(current)
+                current = came_from[current]
+            data = data + [start]
+            data = data[::-1]
+            return data
+        close_set.add(current)
+        for i, j in neighbors:
+            neighbor = current[0] + i, current[1] + j
+            tentative_g_score = gscore[current] + heuristic(current, neighbor)
+            if 0 <= neighbor[0] < array.shape[0]:
+                if 0 <= neighbor[1] < array.shape[1]:                
+                    if array[neighbor[0]][neighbor[1]] == 1:
+                        continue
                 else:
-                    self.get_logger().info('Found Good Point')
-                    self.get_logger().info('Checking Point Distance')
-
-                    distance2new = math.sqrt(
-                        (self.potential_coordinate.point.x - self.current_position.pose.position.x)**2 +
-                        (self.potential_coordinate.point.y- self.current_position.pose.position.y)**2
-                    )
-
-
-                    if min_distance < distance2new < max_distance or self.start:
-                        self.new_waypoint.pose.position.x = self.potential_coordinate.point.x
-                        self.new_waypoint.pose.position.y = self.potential_coordinate.point.y
-                        self.get_logger().info('Point Distance:' + str(distance2new))
-                
-                        isthisagoodwaypoint = True
-
-                        self.strategy_counter -= 1
-                        self.get_logger().info("Remaining points before new strategy:" + str(self.strategy_counter))
-
-                    else:
-                        self.get_logger().info('Point not in range, Finding New...')
-                        isthisagoodwaypoint = False
-                        still_looking = False
-
-                        # If the point is not in range for 30 iterations, adopt a new strategy
-                        not_in_range_count += 1
-                        if not_in_range_count > 50:
-                            self.get_logger().info('Could not find point in range, adopting new strategy...')
-                            self.new_strategy()
-                            isthisagoodwaypoint = True
-                
-                        
-        #New strategy
-        else:
-            self.strategy_counter = 5
-            self.new_strategy()
-           
-        #Publish the new waypoint
-        self.get_logger().info('Publishing waypoint...')
-        self.waypoint_publisher.publish(self.new_waypoint)
-        self.waypoint_counter += 1
-
-    def new_strategy(self):
-        """Processes the occupancy grid and creates a sorted list of cells based on the number of uncertain cells around them."""
-
-        self.get_logger().info('New Strategy: Processing occupancy grid ...')
-        occupancy_data_np = np.array(self.current_grid.data)
-        width = self.current_grid.info.width
-        height = self.current_grid.info.height
-        counts_list = []
-        # Iterate over all cells in the occupancy grid
-        for index in range(len(occupancy_data_np)) :
-            
-            if occupancy_data_np[index] == -1 or occupancy_data_np[index] >= self.obstacle_probability:
-                continue
-
-            [self.potential_coordinate.point.x, self.potential_coordinate.point.y] = self.cell_coordinates(index)
-
-            distance2new = math.sqrt(
-                        (self.potential_coordinate.point.x - self.current_position.pose.position.x)**2 +
-                        (self.potential_coordinate.point.y- self.current_position.pose.position.y)**2
-                    ) 
-
-            # Check if the distance is greater than 9 meters and counter is not a multiple of four
-            if distance2new > 5 and self.new_strategy_counter % 4 != 0:
-                continue
-            else: 
-                # Count the number of uncertain cells around the current cell and append to the list
-                uncertain_count = self.count_uncertain_cells_around(index, occupancy_data_np, width, height)
-                counts_list.append((index, uncertain_count))
-
-        # Sort the list by uncertain_count in descending order
-        sorted_counts = sorted(counts_list, key=lambda x: x[1], reverse=True)
-        
-        try:
-            [self.new_waypoint.pose.position.x,self.new_waypoint.pose.position.y]  = self.cell_coordinates(sorted_counts[0][0])
-            [self.potential_coordinate.point.x, self.potential_coordinate.point.y] = self.cell_coordinates(sorted_counts[0][0])
-        except IndexError as e:
-            self.get_logger().error(f"List of points is empty: {e}")
-
-        distance2new = math.sqrt(
-                        (self.potential_coordinate.point.x - self.current_position.pose.position.x)**2 +
-                        (self.potential_coordinate.point.y- self.current_position.pose.position.y)**2
-                    )
-        
-        self.get_logger().info('New Strategy: Point Distance:' + str(distance2new))
-        self.new_strategy_counter += 1
-        self.potential_publisher.publish(self.potential_coordinate)
-        
-
-
-    def count_uncertain_cells_around(self, index, occupancy_data_np, width, height):
-        """Counts the number of uncertain cells (-1) around a given cell within a defined box size."""
-        uncertain_count = 0
-        box_size = 5  # Define the size of the box around each cell
-
-        # Loop over the box around the cell
-        for x in range(-box_size, box_size + 1):
-            for y in range(-box_size, box_size + 1):
-                slider = x * self.width + y
-                try:
-                    if occupancy_data_np[index + slider] == -1:
-                        uncertain_count += 1
-                #the index of a point next to the index may not be within the range of occupancy_data.data, so the IndexError is handled below
-                except IndexError:
+                    # array bound y walls
                     continue
-        return uncertain_count
-           
-
-    def frontier_check(self, occupancy_data_np, random_index):
-        """
-        Checks if the point we've selected is on the edge of the frontier, but isn't very close to obstacles
-        """
-        uncertain_indexes = 0
-        obstacle_indexes  = 0
-
-    
-        #Inspects the nature of points in a grid around the selected point 
-        for x in range(-4,3):
-            for y in range(-4,3):
-                slider = x * self.width + y
-                try:
-                    if occupancy_data_np[random_index + slider] == -1:
-                        uncertain_indexes += 1
-                    elif occupancy_data_np[random_index + slider] > self.obstacle_probability:
-                        obstacle_indexes += 1
-                #the index of a point next to the random_index may not be within the range of occupancy_data.data, so the IndexError is handled below
-                except IndexError:
-                    continue
-         
-        if uncertain_indexes > 20:
-            return True
-        elif self.fully_mapped and obstacle_indexes > 5:
-            return True
-        else:
-            return False
-        
-
-    def cell_coordinates(self,index):
-        """
-        Given an index of a cell in the occupancy grid, it returns the coordinates of the cell in the map frame.
-        """
-        resolution = 0.05
-        origin_x = self.current_grid.info.origin.position.x
-        origin_y = self.current_grid.info.origin.position.y
-        width = self.current_grid.info.width
-
-        # Compute correspondent row and column of the potential cell
-        row_index_float = index / width
-        row_index = math.ceil(row_index_float)
-        col_index = index % width
-
-        # Compute position with respect map frame of the potential cell
-        x_coord = (col_index*resolution) + origin_x
-        y_coord = (row_index*resolution) + origin_y
-
-        return x_coord, y_coord
-
-    def current_position_callback(self, msg:PoseWithCovarianceStamped):
-        #Return current robot pose, unless searching_for_waypoint
-        self.current_position.pose.position.x = msg.pose.pose.position.x
-        self.current_position.pose.position.y = msg.pose.pose.position.y
-        self.current_position.pose.orientation = msg.pose.pose.orientation
-        self.current_position.header.frame_id = msg.header.frame_id
-
-
-    def aruco_map_position_callback(self, msg:PointStamped):
-        
-        self.aruco_detected = True
-        if not self.localisation_started:
-            aruco_position = PointStamped()
-            aruco_position = msg
-            # Calculate distance to ArUco marker
-            dx = aruco_position.point.x - self.current_position.pose.position.x
-            dy = aruco_position.point.y - self.current_position.pose.position.y
-            distance = math.sqrt(dx*dx + dy*dy)
-
-            if distance > 5:
-                # If further than 6 meters, move to the midpoint
-                self.get_logger().info('ArUco marker is far. Moving to midpoint.')
-                ratio = 0.5  # Midpoint
-                self.new_waypoint.pose.position.x = self.current_position.pose.position.x + dx * ratio
-                self.new_waypoint.pose.position.y = self.current_position.pose.position.y + dy * ratio
-
-                # Calculate orientation towards the ArUco marker
-                angle = math.atan2(dy, dx)
-                self.new_waypoint.pose.orientation.z = math.sin(angle / 2)
-                self.new_waypoint.pose.orientation.w = math.cos(angle / 2)
-
-                self.waypoint_publisher.publish(self.new_waypoint)
-                self.localisation_started = True
-
-            elif distance > self.desired_distance:
-                # If further than 1 meters, move towards the ArUco marker
-                self.new_waypoint = PoseStamped()
-                self.new_waypoint.header.frame_id = 'map'
-                self.new_waypoint.header.stamp = self.get_clock().now().to_msg()
-                
-                # Calculate position 1 meters away from the ArUco marker
-                ratio = 1 - (self.desired_distance/ distance)
-                self.new_waypoint.pose.position.x = self.current_position.pose.position.x + dx * ratio
-                self.new_waypoint.pose.position.y = self.current_position.pose.position.y + dy * ratio
-                
-                # Calculate orientation towards the ArUco marker
-                angle = math.atan2(dy, dx)
-                self.new_waypoint.pose.orientation.z = math.sin(angle / 2)
-                self.new_waypoint.pose.orientation.w = math.cos(angle / 2)
-
-                self.waypoint_publisher.publish(self.new_waypoint)
-                self.get_logger().info('Moving towards the ArUco Marker')
-                self.localisation_started = True
             else:
-                # If within 1 meters, stop and wait
-                self.get_logger().info('Within 1.5 meters of ArUco Marker. Stopping for 15 seconds.')
+                # array bound x walls
+                continue
+            if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, 0):
+                continue
+            if  tentative_g_score < gscore.get(neighbor, 0) or neighbor not in [i[1]for i in oheap]:
+                came_from[neighbor] = current
+                gscore[neighbor] = tentative_g_score
+                fscore[neighbor] = tentative_g_score + heuristic(neighbor, goal)
+                heapq.heappush(oheap, (fscore[neighbor], neighbor))
+    # If no path to goal was found, return closest path to goal
+    if goal not in came_from:
+        closest_node = None
+        closest_dist = float('inf')
+        for node in close_set:
+            dist = heuristic(node, goal)
+            if dist < closest_dist:
+                closest_node = node
+                closest_dist = dist
+        if closest_node is not None:
+            data = []
+            while closest_node in came_from:
+                data.append(closest_node)
+                closest_node = came_from[closest_node]
+            data = data + [start]
+            data = data[::-1]
+            return data
+    return False
+
+def bspline_planning(array, sn):
+    try:
+        array = np.array(array)
+        x = array[:, 0]
+        y = array[:, 1]
+        N = 3
+        t = range(len(x))
+        x_tup = si.splrep(t, x, k=N)
+        y_tup = si.splrep(t, y, k=N)
+
+        x_list = list(x_tup)
+        xl = x.tolist()
+        x_list[1] = xl + [0.0, 0.0, 0.0, 0.0]
+
+        y_list = list(y_tup)
+        yl = y.tolist()
+        y_list[1] = yl + [0.0, 0.0, 0.0, 0.0]
+
+        ipl_t = np.linspace(0.0, len(x) - 1, sn)
+        rx = si.splev(ipl_t, x_list)
+        ry = si.splev(ipl_t, y_list)
+        path = [(rx[i],ry[i]) for i in range(len(rx))]
+    except:
+        path = array
+    return path
+
+def pure_pursuit(current_x, current_y, current_heading, path, index):
+    global lookahead_distance
+
+    if not path or index >= len(path):
+        return 0.0, 0.0, index
+
+    # Geçilen noktaları atla
+    while index < len(path) - 1:
+        dist = math.hypot(current_x - path[index][0], current_y - path[index][1])
+        if dist < lookahead_distance * 0.5:
+            index += 1
+        else:
+            break
+
+    # Lookahead noktasını bul
+    closest_point = None
+    for i in range(index, len(path)):
+        dist = math.hypot(current_x - path[i][0], current_y - path[i][1])
+        if dist >= lookahead_distance:
+            closest_point = path[i]
+            index = i
+            break
+
+    # Lookahead noktası bulunamadıysa son noktayı hedef al
+    if closest_point is None:
+        closest_point = path[-1]
+        index = len(path) - 1
+
+    # Hedefe açı hesapla
+    target_heading = math.atan2(
+        closest_point[1] - current_y,
+        closest_point[0] - current_x
+    )
+
+    desired_steering_angle = target_heading - current_heading
+
+    # Normalize [-pi, pi]
+    while desired_steering_angle >  math.pi: desired_steering_angle -= 2 * math.pi
+    while desired_steering_angle < -math.pi: desired_steering_angle += 2 * math.pi
+
+    # Hedefe olan mesafe — sona yaklaşınca yavaşla
+    dist_to_goal = math.hypot(current_x - path[-1][0], current_y - path[-1][1])
+    v = speed * min(1.0, dist_to_goal / (lookahead_distance * 2))
+    v = max(v, speed * 0.3)  # minimum hız
+
+    # Açıya göre hız ayarla
+    abs_angle = abs(desired_steering_angle)
+
+    if abs_angle > math.pi / 2:
+        # 90°'den fazla — dur, sadece dön
+        v = 0.0
+        sign = 1 if desired_steering_angle > 0 else -1
+        desired_steering_angle = sign * math.pi / 2
+
+    elif abs_angle > math.pi / 4:
+        # 45-90° arası — çok yavaş ilerle
+        v *= 0.2
+        sign = 1 if desired_steering_angle > 0 else -1
+        desired_steering_angle = sign * math.pi / 3
+
+    elif abs_angle > math.pi / 6:
+        # 30-45° arası — yavaşla
+        v *= 0.5
+
+    # w sınırla
+    desired_steering_angle = max(-math.pi / 2, min(math.pi / 2, desired_steering_angle))
+
+    return v, desired_steering_angle, index
+
+def frontierB(matrix):
+    for i in range(len(matrix)):
+        for j in range(len(matrix[i])):
+            if matrix[i][j] == 0.0:
+                if i > 0 and matrix[i-1][j] < 0:
+                    matrix[i][j] = 2
+                elif i < len(matrix)-1 and matrix[i+1][j] < 0:
+                    matrix[i][j] = 2
+                elif j > 0 and matrix[i][j-1] < 0:
+                    matrix[i][j] = 2
+                elif j < len(matrix[i])-1 and matrix[i][j+1] < 0:
+                    matrix[i][j] = 2
+    return matrix
+
+def assign_groups(matrix):
+    from sklearn.cluster import DBSCAN
+    
+    points = np.argwhere(np.array(matrix) == 2)
+    groups = {}
+
+    if len(points) == 0:
+        return matrix, groups
+
+    db = DBSCAN(eps=2.0, min_samples=3).fit(points)
+    labels = db.labels_
+
+    for idx, label in enumerate(labels):
+        if label == -1:
+            continue
+        if label not in groups:
+            groups[label] = []
+        groups[label].append((int(points[idx][0]), int(points[idx][1])))
+
+    # fGroups dict formatı (key, value) bekliyor — uyumlu tut
+    groups = {k+1: v for k, v in groups.items()}
+
+    return matrix, groups
+
+def dfs(matrix, i, j, group, groups):
+    stack = [(i, j)]
+    while stack:
+        ci, cj = stack.pop()
+        if ci < 0 or ci >= len(matrix) or cj < 0 or cj >= len(matrix[0]):
+            continue
+        if matrix[ci][cj] != 2:
+            continue
+        if group in groups:
+            groups[group].append((ci, cj))
+        else:
+            groups[group] = [(ci, cj)]
+        matrix[ci][cj] = 0  # mark visited
+        stack.append((ci + 1, cj))
+        stack.append((ci - 1, cj))
+        stack.append((ci, cj + 1))
+        stack.append((ci, cj - 1))
+        stack.append((ci + 1, cj + 1))
+        stack.append((ci - 1, cj - 1))
+        stack.append((ci - 1, cj + 1))
+        stack.append((ci + 1, cj - 1))
+    return group + 1
+
+def fGroups(groups):
+    sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
+    top_five_groups = [g for g in sorted_groups[:5] if len(g[1]) > 2]    
+    return top_five_groups
+
+def calculate_centroid(x_coords, y_coords):
+    n = len(x_coords)
+    sum_x = sum(x_coords)
+    sum_y = sum(y_coords)
+    mean_x = sum_x / n
+    mean_y = sum_y / n
+    centroid = (int(mean_x), int(mean_y))
+    return centroid
+
+#Bu fonksiyon en buyuk 5 gruptan target_error*2 uzaklıktan daha uzak olan ve robota en yakın olanı seçer.
+"""
+def findClosestGroup(matrix,groups, current,resolution,originX,originY):
+    targetP = None
+    distances = []
+    paths = []
+    min_index = -1
+    for i in range(len(groups)):
+        middle = calculate_centroid([p[0] for p in groups[i][1]],[p[1] for p in groups[i][1]]) 
+        path = astar(matrix, current, middle)
+        path = [(p[1]*resolution+originX,p[0]*resolution+originY) for p in path]
+        total_distance = pathLength(path)
+        distances.append(total_distance)
+        paths.append(path)
+    for i in range(len(distances)):
+        if distances[i] > target_error*3:
+            if min_index == -1 or distances[i] < distances[min_index]:
+                min_index = i
+    if min_index != -1:
+        targetP = paths[min_index]
+    else: #gruplar target_error*2 uzaklıktan daha yakınsa random bir noktayı hedef olarak seçer. Bu robotun bazı durumlardan kurtulmasını sağlar.
+        index = random.randint(0,len(groups)-1)
+        target = groups[index][1]
+        target = target[random.randint(0,len(target)-1)]
+        path = astar(matrix, current, target)
+        targetP = [(p[1]*resolution+originX,p[0]*resolution+originY) for p in path]
+    return targetP
+"""
+def findClosestGroup(matrix,groups, current,resolution,originX,originY):
+    targetP = None
+    distances = []
+    paths = []
+    score = []
+    max_score = -1 #max score index
+    for i in range(len(groups)):
+        middle = calculate_centroid([p[0] for p in groups[i][1]],[p[1] for p in groups[i][1]]) 
+        path = astar(matrix, current, middle)
+        path = [(p[1]*resolution+originX,p[0]*resolution+originY) for p in path]
+        total_distance = pathLength(path)
+        distances.append(total_distance)
+        paths.append(path)
+    for i in range(len(distances)):
+        if distances[i] == 0:
+            score.append(0)
+        else:
+            score.append(len(groups[i][1])/distances[i])
+    for i in range(len(distances)):
+        if distances[i] > target_error*3:
+            if max_score == -1 or score[i] > score[max_score]:
+                max_score = i
+    if max_score != -1:
+        targetP = paths[max_score]
+    else: #gruplar target_error*2 uzaklıktan daha yakınsa random bir noktayı hedef olarak seçer. Bu robotun bazı durumlardan kurtulmasını sağlar.
+        index = random.randint(0,len(groups)-1)
+        target = groups[index][1]
+        target = target[random.randint(0,len(target)-1)]
+        path = astar(matrix, current, target)
+        targetP = [(p[1]*resolution+originX,p[0]*resolution+originY) for p in path]
+    return targetP
+
+def pathLength(path):
+    for i in range(len(path)):
+        path[i] = (path[i][0],path[i][1])
+        points = np.array(path)
+    differences = np.diff(points, axis=0)
+    distances = np.hypot(differences[:,0], differences[:,1])
+    total_distance = np.sum(distances)
+    return total_distance
+
+def costmap(data,width,height,resolution):
+    data = np.array(data).reshape(height,width)
+    wall = np.where(data == 100)
+    for i in range(-expansion_size,expansion_size+1):
+        for j in range(-expansion_size,expansion_size+1):
+            if i  == 0 and j == 0:
+                continue
+            x = wall[0]+i
+            y = wall[1]+j
+            x = np.clip(x,0,height-1)
+            y = np.clip(y,0,width-1)
+            data[x,y] = 100
+    data = data*resolution
+    return data
+
+def exploration(data,width,height,resolution,column,row,originX,originY):
+        global pathGlobal #Global degisken
+        data = costmap(data,width,height,resolution) #Engelleri genislet
+        data[row][column] = 0 #Robot Anlık Konum
+        data[data > 5] = 1 # 0 olanlar gidilebilir yer, 100 olanlar kesin engel
+        data = frontierB(data) #Sınır noktaları bul
+        data,groups = assign_groups(data) #Sınır noktaları gruplandır
+        groups = fGroups(groups) #Grupları küçükten büyüğe sırala. En buyuk 5 grubu al
+        if len(groups) == 0: #Grup yoksa kesif tamamlandı
+            path = -1
+        else: #Grup varsa en yakın grubu bul
+            data[data < 0] = 1 #-0.05 olanlar bilinmeyen yer. Gidilemez olarak isaretle. 0 = gidilebilir, 1 = gidilemez.
+            path = findClosestGroup(data,groups,(row,column),resolution,originX,originY) #En yakın grubu bul
+            if path != None: #Yol varsa BSpline ile düzelt
+                path = bspline_planning(path,len(path)*10)
+            else:
+                path = -1
+        pathGlobal = path
+        return
+
+def localControl(scan):
+    v = None
+    w = None
+    n = len(scan)  # ~179
+    if n == 0:
+        return v, w
+
+    def min_range(start_deg, end_deg):
+        # angle_min=-180, angle_increment=2° → idx = (deg+180)/2
+        def deg_to_idx(d):
+            return int((d + 180) / 360.0 * n)
+        s = max(0, deg_to_idx(start_deg))
+        e = min(n, deg_to_idx(end_deg))
+        if s >= e:
+            return float('inf')
+        valid = [scan[i] for i in range(s, e)
+                 if not math.isinf(scan[i])
+                 and not math.isnan(scan[i])
+                 and scan[i] > 0.05]
+        return min(valid) if valid else float('inf')
+
+    # 0° = ön, + = sol, - = sağ (REP-117)
+    front        = min_range(-15,  15)   # tam ön ±15°
+    front_left   = min_range( 15,  60)   # sol ön
+    front_right  = min_range(-60, -15)   # sağ ön
+    left         = min_range( 60,  120)  # tam sol
+    right        = min_range(-120, -60)  # tam sağ
+
+    STOP    = robot_r * 1.5
+    DANGER  = robot_r * 2.5
+    CAUTION = robot_r * 4.0
+
+    # 1. Acil — önde çok yakın
+    if front < STOP:
+        v = 0.0
+        w = math.pi / 2 if left > right else -math.pi / 2
+        return v, w
+
+    # 2. Köşe tuzağı — iki taraf birden kapalı
+    if front_left < DANGER and front_right < DANGER:
+        v = 0.0
+        w = math.pi / 2 if left > right else -math.pi / 2
+        return v, w
+
+    # 3. Sağ önde engel → sola kır
+    if front_right < DANGER:
+        v = 0.05
+        w = math.pi / 3
+        return v, w
+
+    # 4. Sol önde engel → sağa kır
+    if front_left < DANGER:
+        v = 0.05
+        w = -math.pi / 3
+        return v, w
+
+    # 5. Tam yanda duvar
+    if right < STOP:
+        v = 0.1
+        w = math.pi / 4
+        return v, w
+
+    if left < STOP:
+        v = 0.1
+        w = -math.pi / 4
+        return v, w
+
+    # 6. Temkinli yaklaşım
+    if front < CAUTION:
+        v = 0.1
+        w = math.pi / 6 if front_right < front_left else -math.pi / 6
+        return v, w
+
+    return v, w
+class navigationControl(Node):
+    def __init__(self):
+        super().__init__('Exploration')
+        self.subscription = self.create_subscription(OccupancyGrid,'map',self.map_callback,10)
+        self.subscription = self.create_subscription(Odometry,'odom',self.odom_callback,10)
+        self.subscription = self.create_subscription(LaserScan,'scan',self.scan_callback,10)
+        self.publisher = self.create_publisher(Twist, 'cmd_vel', 10)
+        print("[BILGI] KESİF MODU AKTİF")
+        self.kesif = True
+        threading.Thread(target=self.exp).start() #Kesif fonksiyonunu thread olarak calistirir.
+        
+    def exp(self):
+        twist = Twist()
+        while True: #Sensor verileri gelene kadar bekle.
+            if not hasattr(self,'map_data') or not hasattr(self,'odom_data') or not hasattr(self,'scan_data'):
+                time.sleep(0.1)
+                continue
+            if self.kesif == True:
+                if isinstance(pathGlobal, int) and pathGlobal == 0:
+                    column = int((self.x - self.originX)/self.resolution)
+                    row = int((self.y- self.originY)/self.resolution)
+                    exploration(self.data,self.width,self.height,self.resolution,column,row,self.originX,self.originY)
+                    self.path = pathGlobal
+                else:
+                    self.path = pathGlobal
+                if isinstance(self.path, int) and self.path == -1:
+                    print("[BILGI] KESİF TAMAMLANDI")
+
+                    twist = Twist()
+                    twist.linear.x = 0.0
+                    twist.angular.z = 0.0
+                    self.publisher.publish(twist)
+
+                    self.kesif = False
+                    rclpy.shutdown()
+                    return
                 
-                # Publish current position as waypoint to make the robot stop
-                stop_waypoint = PoseStamped()
-                stop_waypoint.header.frame_id = 'map'
-                stop_waypoint.header.stamp = self.get_clock().now().to_msg()
-                stop_waypoint.pose.position.x = self.current_position.pose.position.x
-                stop_waypoint.pose.position.y = self.current_position.pose.position.y
-                stop_waypoint.pose.orientation = self.current_position.pose.orientation
-                self.waypoint_publisher.publish(stop_waypoint)
-                self.localisation_started = True
-
-       
-
-    def readiness_check(self, msg:BehaviorTreeLog):
-        """
-        Call the next_waypoint() when specific conditions of the BehaviorTreeLog message are satisfied
-        """
-
-        for event in msg.event_log:
+                self.c = int((self.path[-1][0] - self.originX)/self.resolution) 
+                self.r = int((self.path[-1][1] - self.originY)/self.resolution) 
+                self.kesif = False
+                self.i = 0
+                print("[BILGI] YENI HEDEF BELİRLENDI")
+                t = pathLength(self.path)/speed
+                t = t - 0.2 #x = v * t formülüne göre hesaplanan sureden 0.2 saniye cikarilir. t sure sonra kesif fonksiyonu calistirilir.
+                self.t = threading.Timer(t,self.target_callback) #Hedefe az bir sure kala kesif fonksiyonunu calistirir.
+                self.t.start()
             
+            #Rota Takip Blok Baslangic
+            else:
+                v , w = localControl(self.scan)
+                if v == None:
+                    v, w,self.i = pure_pursuit(self.x,self.y,self.yaw,self.path,self.i)
+                if(abs(self.x - self.path[-1][0]) < target_error and abs(self.y - self.path[-1][1]) < target_error):
+                    v = 0.0
+                    w = 0.0
+                    self.kesif = True
+                    print("[BILGI] HEDEFE ULASILDI")
+                    self.t.join() #Thread bitene kadar bekle.
+                twist.linear.x = v
+                twist.angular.z = w
+                self.publisher.publish(twist)
+                time.sleep(0.1)
+            #Rota Takip Blok Bitis
 
-            if event.node_name == 'NavigateRecovery' and event.current_status =='IDLE':
-                self.get_logger().info('NavigateRecovery--IDLE received')
+    def target_callback(self):
+        exploration(self.data,self.width,self.height,self.resolution,self.c,self.r,self.originX,self.originY)
+        
+    def scan_callback(self,msg):
+        self.scan_data = msg
+        self.scan = msg.ranges
 
-                if not self.aruco_detected:
-                    self.next_waypoint()
-                    self.goal_updated_counter = 0
+    def map_callback(self,msg):
+        self.map_data = msg
+        self.resolution = self.map_data.info.resolution
+        self.originX = self.map_data.info.origin.position.x
+        self.originY = self.map_data.info.origin.position.y
+        self.width = self.map_data.info.width
+        self.height = self.map_data.info.height
+        self.data = self.map_data.data
 
-                if self.localisation_started:
-                    time.sleep(15)
-                    self.next_waypoint()
-                    self.localisation_started = False
-                    self.aruco_detected = False
-
-            if event.node_name == 'GoalUpdated' and event.current_status =='FAILURE':
-                self.goal_updated_counter += 1
-                if self.goal_updated_counter > 500:
-                    if not self.aruco_detected:
-                        self.next_waypoint()
-                        self.goal_updated_counter = 0
+    def odom_callback(self,msg):
+        self.odom_data = msg
+        self.x = msg.pose.pose.position.x
+        self.y = msg.pose.pose.position.y
+        self.yaw = euler_from_quaternion(msg.pose.pose.orientation.x,msg.pose.pose.orientation.y,
+        msg.pose.pose.orientation.z,msg.pose.pose.orientation.w)
 
 
-def main():
-    rclpy.init()
-    autopilot_node = Autopilot()
-    autopilot_node.get_logger().info('Running autopilot node')
-    rclpy.spin(autopilot_node)
+def main(args=None):
+    rclpy.init(args=args)
+    navigation_control = navigationControl()
+    rclpy.spin(navigation_control)
+    navigation_control.destroy_node()
+    rclpy.shutdown()
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
